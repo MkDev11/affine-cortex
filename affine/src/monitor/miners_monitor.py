@@ -260,7 +260,18 @@ class MinersMonitor:
             chute_id=chute_id,
             block=block,
         )
-        
+
+        # Inherit template_check_result from database if model/revision unchanged
+        # This prevents losing the result when earlier steps fail
+        try:
+            existing = await self.dao.get_miner_by_uid(uid)
+            if (existing and
+                existing.get('model') == model and
+                existing.get('revision') == revision):
+                info.template_check_result = existing.get('template_check_result')
+        except Exception:
+            pass  # Ignore errors, will check template later if needed
+
         # Step 1: Fetch chute info
         chute = await get_chute_info(chute_id)
         if not chute:
@@ -344,24 +355,16 @@ class MinersMonitor:
             return info
 
         try:
-            existing = await self.dao.get_miner_by_uid(uid)
-            cached_result = None
-
-            # Use cached result if model/revision unchanged
-            if (existing and
-                existing.get('model') == model and
-                existing.get('revision') == revision):
-                cached_result = existing.get('template_check_result')
+            # Use inherited template_check_result as cache (already loaded at start)
+            cached_result = info.template_check_result
 
             if cached_result == "safe":
                 # Previously passed, skip check
                 logger.debug(f"[MinersMonitor] Skipping template check for uid={uid} (cached: safe)")
-                info.template_check_result = "safe"
             elif cached_result and cached_result.startswith("unsafe:"):
                 # Previously failed, use cached result directly
                 info.is_valid = False
                 info.invalid_reason = f"malicious_template:{cached_result[7:]}"
-                info.template_check_result = cached_result
                 logger.debug(f"[MinersMonitor] Using cached template result for uid={uid}: {cached_result}")
                 return info
             else:
