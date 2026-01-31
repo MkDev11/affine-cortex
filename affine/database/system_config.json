@@ -51,7 +51,7 @@
           "field": "tasks.completed_up_to",
           "range_type": "zero_to_value"
         },
-        "sampling_count": 20,
+        "sampling_count": 100,
         "rotation_enabled": false,
         "rotation_count": 0,
         "rotation_interval": 3600,
