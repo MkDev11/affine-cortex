@@ -211,13 +211,53 @@ class MinersMonitor:
             result = (model_hash, actual_revision) if model_hash and actual_revision else None
             self.weights_cache[key] = (result, now)
             return result
-            
+
         except Exception as e:
             logger.warning(
                 f"Failed to fetch model info for {model_id}@{revision}: {type(e).__name__}: {e}",
                 exc_info=True
             )
             self.weights_cache[key] = (None, now)
+            return None
+
+    async def _is_duplicate_commit(self, model_id: str, revision: str) -> Optional[str]:
+        """Check if the commit is a 'Duplicate from xxx' commit
+
+        Args:
+            model_id: HuggingFace model repo
+            revision: Git commit hash to check
+
+        Returns:
+            Source repo name if it's a duplicate commit, None otherwise
+        """
+        try:
+            def _list_commits():
+                return HfApi(token=os.getenv("HF_TOKEN")).list_repo_commits(
+                    repo_id=model_id,
+                    repo_type="model",
+                    revision=revision,
+                )
+
+            commits = await asyncio.to_thread(_list_commits)
+
+            # Find the commit matching the revision
+            for commit in commits:
+                commit_id = getattr(commit, "commit_id", None)
+                if commit_id == revision:
+                    title = getattr(commit, "title", "") or ""
+                    # Check if title starts with "Duplicate from"
+                    if title.lower().startswith("duplicate from"):
+                        # Extract source repo (format: "Duplicate from xxx")
+                        source = title[len("Duplicate from"):].strip()
+                        return source
+                    break
+
+            return None
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to check duplicate commit for {model_id}@{revision}: {type(e).__name__}: {e}"
+            )
             return None
     
     async def _validate_miner(
@@ -240,6 +280,8 @@ class MinersMonitor:
         6. Verify repo name ends with hotkey
         7. Verify revision matches chute
         8. Fetch HuggingFace model info and verify revision
+        9. Check if commit is "Duplicate from xxx" (plagiarism check)
+        10. Check chat_template for malicious code
 
         Args:
             uid: Miner UID
@@ -347,7 +389,19 @@ class MinersMonitor:
             info.invalid_reason = f"revision_mismatch:hf={hf_revision}"
             return info
 
-        # Step 9: Check chat_template for malicious code (with database cache)
+        # Step 9: Check if commit is a "Duplicate from xxx" (except uid 0)
+        if uid != 0:
+            duplicate_source = await self._is_duplicate_commit(model, revision)
+            if duplicate_source:
+                info.is_valid = False
+                info.invalid_reason = f"duplicate_repo:from={duplicate_source}"
+                logger.info(
+                    f"[MinersMonitor] Duplicate repo detected for uid={uid}: "
+                    f"model={model} is duplicated from {duplicate_source}"
+                )
+                return info
+
+        # Step 10: Check chat_template for malicious code (with database cache)
         # Skip for uid 0 (test/admin miner)
         if uid == 0:
             info.template_check_result = "safe"
