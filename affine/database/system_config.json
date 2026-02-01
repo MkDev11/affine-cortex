@@ -43,7 +43,7 @@
     "SWE-SYNTH": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": false,
-      "min_completeness": 0.5,
+      "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[300, 400]],
         "dataset_range_source": {
