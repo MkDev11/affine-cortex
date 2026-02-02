@@ -25,6 +25,277 @@ def get_conf(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(key, default)
 
 
+# ============================================================================
+# Private HuggingFace Repo Workflow Helpers
+# ============================================================================
+
+class PrivateRepoWorkflow:
+    """Manages private HuggingFace repository workflow for secure model deployment.
+    
+    This workflow prevents other miners from monitoring and copying models before
+    the original miner can commit to the blockchain. The flow is:
+    
+    1. Create PRIVATE HuggingFace repo
+    2. Upload model to private HF repo
+    3. Store HF_TOKEN as Chutes secret (so Chutes can access private repo)
+    4. Deploy to Chutes (pulls from private HF repo using secret)
+    5. Commit to blockchain
+    6. Make HF repo PUBLIC after commit confirmed
+    """
+    
+    CHUTES_API_BASE = "https://api.chutes.ai"
+    SECRET_KEY_HF_TOKEN = "HF_TOKEN"
+    
+    def __init__(self, hf_token: str, chutes_api_key: str):
+        """Initialize the workflow manager.
+        
+        Args:
+            hf_token: HuggingFace API token with write access
+            chutes_api_key: Chutes API key for secret management
+        """
+        self.hf_token = hf_token
+        self.chutes_api_key = chutes_api_key
+        self._hf_api = None
+    
+    @property
+    def hf_api(self):
+        """Lazy-load HuggingFace API client."""
+        if self._hf_api is None:
+            from huggingface_hub import HfApi
+            self._hf_api = HfApi(token=self.hf_token)
+        return self._hf_api
+    
+    def create_private_repo(self, repo_id: str) -> bool:
+        """Create a private HuggingFace repository.
+        
+        Args:
+            repo_id: Repository ID (e.g., "username/model-name")
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            self.hf_api.create_repo(
+                repo_id=repo_id,
+                exist_ok=True,
+                repo_type="model",
+                private=True
+            )
+            logger.info(f"Created/verified private repo: {repo_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create private repo {repo_id}: {e}")
+            return False
+    
+    def upload_to_repo(
+        self,
+        repo_id: str,
+        folder_path: str,
+        commit_message: str = "Model update"
+    ) -> Optional[str]:
+        """Upload model folder to HuggingFace repository.
+        
+        Args:
+            repo_id: Repository ID
+            folder_path: Local path to model folder
+            commit_message: Commit message for the upload
+            
+        Returns:
+            Revision SHA if successful, None otherwise
+        """
+        try:
+            self.hf_api.upload_folder(
+                folder_path=folder_path,
+                repo_id=repo_id,
+                commit_message=commit_message
+            )
+            info = self.hf_api.repo_info(repo_id, repo_type="model")
+            revision = info.sha
+            logger.info(f"Uploaded to {repo_id}, revision: {revision[:12]}...")
+            return revision
+        except Exception as e:
+            logger.error(f"Failed to upload to {repo_id}: {e}")
+            return None
+    
+    def update_visibility(self, repo_id: str, private: bool) -> bool:
+        """Update HuggingFace repository visibility.
+        
+        Args:
+            repo_id: Repository ID
+            private: True for private, False for public
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            from huggingface_hub import update_repo_settings
+            update_repo_settings(
+                repo_id=repo_id,
+                private=private,
+                token=self.hf_token
+            )
+            visibility = "private" if private else "public"
+            logger.info(f"Updated {repo_id} visibility to {visibility}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update visibility for {repo_id}: {e}")
+            return False
+    
+    def make_public(self, repo_id: str) -> bool:
+        """Make a HuggingFace repository public.
+        
+        Args:
+            repo_id: Repository ID
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        return self.update_visibility(repo_id, private=False)
+    
+    async def create_chutes_secret(
+        self,
+        chute_name: str,
+        key: str,
+        value: str
+    ) -> bool:
+        """Create a secret for a Chute deployment.
+        
+        This allows Chutes to access private HuggingFace repositories
+        by storing the HF_TOKEN as an environment variable secret.
+        
+        Args:
+            chute_name: Chute name or identifier for the secret purpose
+            key: Secret key name (e.g., "HF_TOKEN")
+            value: Secret value
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        import aiohttp
+        
+        url = f"{self.CHUTES_API_BASE}/secrets/"
+        payload = {
+            "purpose": chute_name,
+            "key": key,
+            "value": value
+        }
+        headers = {
+            "Authorization": f"Bearer {self.chutes_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status in (200, 201):
+                        data = await response.json()
+                        secret_id = data.get("secret_id", data.get("id", "unknown"))
+                        logger.info(f"Created Chutes secret '{key}' for {chute_name} (id: {secret_id})")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to create Chutes secret: {response.status} - {error_text}")
+                        return False
+        except Exception as e:
+            logger.error(f"Failed to create Chutes secret: {e}")
+            return False
+    
+    async def delete_chutes_secret(self, secret_id: str) -> bool:
+        """Delete a Chutes secret by ID.
+        
+        Args:
+            secret_id: Secret identifier to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        import aiohttp
+        
+        url = f"{self.CHUTES_API_BASE}/secrets/{secret_id}"
+        headers = {
+            "Authorization": f"Bearer {self.chutes_api_key}"
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, headers=headers) as response:
+                    if response.status in (200, 204):
+                        logger.info(f"Deleted Chutes secret: {secret_id}")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.warning(f"Failed to delete Chutes secret: {response.status} - {error_text}")
+                        return False
+        except Exception as e:
+            logger.warning(f"Failed to delete Chutes secret: {e}")
+            return False
+    
+    async def setup_private_repo_for_chutes(self, repo_id: str) -> bool:
+        """Set up HF_TOKEN secret for Chutes to access private HF repo.
+        
+        Args:
+            repo_id: Repository ID (used as purpose identifier)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        return await self.create_chutes_secret(
+            chute_name=repo_id,
+            key=self.SECRET_KEY_HF_TOKEN,
+            value=self.hf_token
+        )
+    
+    async def execute_private_upload(
+        self,
+        repo_id: str,
+        folder_path: str,
+        commit_message: str = "Model update"
+    ) -> Optional[str]:
+        """Execute the private upload workflow.
+        
+        1. Create private HF repo
+        2. Upload model
+        3. Set up Chutes secret for private access
+        
+        Args:
+            repo_id: Repository ID
+            folder_path: Local path to model folder
+            commit_message: Commit message
+            
+        Returns:
+            Revision SHA if successful, None otherwise
+        """
+        if not self.create_private_repo(repo_id):
+            return None
+        
+        revision = self.upload_to_repo(repo_id, folder_path, commit_message)
+        if not revision:
+            return None
+        
+        if not await self.setup_private_repo_for_chutes(repo_id):
+            logger.warning("Failed to set up Chutes secret, deployment may fail")
+        
+        return revision
+    
+    async def finalize_after_commit(self, repo_id: str) -> bool:
+        """Finalize workflow after successful on-chain commit.
+        
+        Makes the HuggingFace repository public so validators can access it.
+        
+        Args:
+            repo_id: Repository ID
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        logger.info(f"Finalizing private repo workflow for {repo_id}...")
+        success = self.make_public(repo_id)
+        if success:
+            logger.info(f"Repository {repo_id} is now public")
+        else:
+            logger.error(f"Failed to make {repo_id} public - manual intervention required")
+        return success
+
 
 # ============================================================================
 # Command Implementations
@@ -534,6 +805,7 @@ async def deploy_command(
     coldkey: Optional[str] = None,
     hotkey: Optional[str] = None,
     hf_token: Optional[str] = None,
+    private_repo: bool = False,
 ):
     """One-command deployment: Upload to HuggingFace -> Deploy to Chutes -> Commit on-chain.
     
@@ -541,6 +813,12 @@ async def deploy_command(
     1. Upload model to HuggingFace (skip with --skip-upload if already uploaded)
     2. Deploy to Chutes (skip with --skip-chutes if already deployed)
     3. Commit on-chain (skip with --skip-commit to test without committing)
+    4. Make HF repo public (if --private-repo was used)
+    
+    Private Repo Workflow (--private-repo):
+    Prevents other miners from monitoring and copying your model before commit.
+    The workflow creates a private HF repo, stores HF_TOKEN as a Chutes secret,
+    deploys, commits, then makes the repo public.
     
     Args:
         repo: HuggingFace repository ID (e.g., "username/model-name")
@@ -557,6 +835,7 @@ async def deploy_command(
         coldkey: Wallet coldkey name (optional, from env if not provided)
         hotkey: Wallet hotkey name (optional, from env if not provided)
         hf_token: HuggingFace token (optional, from env if not provided)
+        private_repo: Use private HF repo workflow (publish after commit)
     """
     from huggingface_hub import HfApi
     
@@ -621,44 +900,68 @@ async def deploy_command(
     if chute_id:
         logger.info(f"  Chute ID: {chute_id}")
     logger.info(f"  Steps: {' -> '.join(steps) if steps else 'none'}")
+    if private_repo:
+        logger.info("  Mode: PRIVATE REPO (will publish after commit)")
     if dry_run:
         logger.info("  Mode: DRY RUN")
     logger.info("=" * 60)
+    
+    # Initialize private repo workflow manager if needed
+    private_workflow = None
+    if private_repo and not dry_run:
+        private_workflow = PrivateRepoWorkflow(
+            hf_token=hf_token,
+            chutes_api_key=chutes_api_key
+        )
     
     # =========================================================================
     # Step 1: Upload to HuggingFace
     # =========================================================================
     if not skip_upload:
         current_step += 1
-        logger.info(f"[{current_step}/{total_steps}] Uploading to HuggingFace ({repo})...")
+        upload_mode = "PRIVATE" if private_repo else "public"
+        logger.info(f"[{current_step}/{total_steps}] Uploading to HuggingFace ({repo}) [{upload_mode}]...")
         
         if dry_run:
-            logger.info(f"  [DRY RUN] Would upload {model_path} to {repo}")
+            logger.info(f"  [DRY RUN] Would upload {model_path} to {repo} (private={private_repo})")
             revision = "dry-run-revision-sha"
         else:
             try:
-                api = HfApi(token=hf_token)
-                
-                # Create repo if doesn't exist
-                try:
-                    api.create_repo(repo, exist_ok=True, repo_type="model")
-                    logger.debug(f"Repository {repo} ready")
-                except Exception as e:
-                    logger.debug(f"Repo creation note: {e}")
-                
-                # Upload folder
-                logger.info(f"  Uploading {model_path}...")
-                api.upload_folder(
-                    folder_path=model_path,
-                    repo_id=repo,
-                    commit_message=message
-                )
-                
-                # Get latest commit SHA
-                info = api.repo_info(repo, repo_type="model")
-                revision = info.sha
-                
-                logger.info(f"  Upload complete. Revision: {revision[:12]}...")
+                # Use private workflow if enabled
+                if private_workflow:
+                    logger.info(f"  Using private repo workflow...")
+                    revision = await private_workflow.execute_private_upload(
+                        repo_id=repo,
+                        folder_path=model_path,
+                        commit_message=message
+                    )
+                    if not revision:
+                        raise RuntimeError("Private upload workflow failed")
+                    logger.info(f"  Private upload complete. Revision: {revision[:12]}...")
+                else:
+                    # Standard public upload
+                    api = HfApi(token=hf_token)
+                    
+                    # Create repo if doesn't exist
+                    try:
+                        api.create_repo(repo, exist_ok=True, repo_type="model")
+                        logger.debug(f"Repository {repo} ready")
+                    except Exception as e:
+                        logger.debug(f"Repo creation note: {e}")
+                    
+                    # Upload folder
+                    logger.info(f"  Uploading {model_path}...")
+                    api.upload_folder(
+                        folder_path=model_path,
+                        repo_id=repo,
+                        commit_message=message
+                    )
+                    
+                    # Get latest commit SHA
+                    info = api.repo_info(repo, repo_type="model")
+                    revision = info.sha
+                    
+                    logger.info(f"  Upload complete. Revision: {revision[:12]}...")
                 
             except Exception as e:
                 logger.error(f"HuggingFace upload failed: {e}")
@@ -809,12 +1112,26 @@ chute = build_sglang_chute(
                 
                 logger.info("  Commit successful")
                 
+                # =========================================================
+                # Step 4: Make HF repo public (if private workflow)
+                # =========================================================
+                if private_workflow:
+                    logger.info(f"[{current_step}/{total_steps}] Making HF repo public...")
+                    if not await private_workflow.finalize_after_commit(repo):
+                        logger.warning("Failed to make repo public - manual intervention may be required")
+                        logger.warning(f"Run: huggingface-cli repo visibility {repo} --public")
+                
             except Exception as e:
                 logger.error(f"On-chain commit failed: {e}")
                 print(json.dumps({"success": False, "error": f"On-chain commit failed: {str(e)}"}))
                 sys.exit(1)
     else:
         logger.info("Skipping on-chain commit")
+        
+        # If skipping commit but using private repo, warn user
+        if private_repo:
+            logger.warning("Private repo workflow: HF repo remains PRIVATE since commit was skipped")
+            logger.warning(f"To make public later: huggingface-cli repo visibility {repo} --public")
     
     # =========================================================================
     # Summary
@@ -835,6 +1152,8 @@ chute = build_sglang_chute(
         "repo": repo,
         "revision": revision,
         "chute_id": chute_id,
-        "dry_run": dry_run
+        "dry_run": dry_run,
+        "private_repo": private_repo,
+        "repo_visibility": "public" if (private_repo and not skip_commit and not dry_run) else ("private" if private_repo else "public")
     }
     print(json.dumps(result))
