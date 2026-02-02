@@ -192,7 +192,6 @@ class MinersMonitor:
                 return hf_api.list_repo_commits(
                     repo_id=model_id,
                     repo_type="model",
-                    revision=revision,
                 )
 
             info = await asyncio.to_thread(_repo_info)
