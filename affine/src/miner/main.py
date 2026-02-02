@@ -200,21 +200,26 @@ def get_envs():
 @click.option("--coldkey", help="Wallet coldkey name (optional, from env if not provided)")
 @click.option("--hotkey", help="Wallet hotkey name (optional, from env if not provided)")
 @click.option("--hf-token", help="HuggingFace token (optional, from env if not provided)")
-@click.option("--private-repo", is_flag=True, help="Use private HF repo workflow (publish after commit)")
+@click.option("--private-repo", is_flag=True, help="Use private HF repo workflow (commit before deploy)")
 def deploy(repo, model_path, revision, chute_id, message, dry_run, skip_upload, skip_chutes, skip_commit, chutes_api_key, chute_user, coldkey, hotkey, hf_token, private_repo):
     """One-command deployment: Upload -> Deploy -> Commit.
     
-    Combines the three-step deployment process into a single command:
+    Normal workflow:
     1. Upload model to HuggingFace (skip with --skip-upload)
     2. Deploy to Chutes (skip with --skip-chutes)
     3. Commit on-chain (skip with --skip-commit)
-    4. Make HF repo public (if --private-repo was used)
     
     Private Repo Workflow (--private-repo):
-        Prevents other miners from monitoring and copying your model before
-        the on-chain commit is confirmed. Creates a private HF repo, stores
-        HF_TOKEN as a Chutes secret for deployment, then makes repo public
-        after successful commit.
+        Prevents cheaters from copying your model before your commit is on-chain.
+        Uses a different order to ensure model stays hidden until committed:
+        
+        1. Upload to PRIVATE HuggingFace repo
+        2. Pre-generate chute_id (deterministic from username + repo)
+        3. COMMIT FIRST to blockchain with pre-generated chute_id
+        4. Make HF repo PUBLIC after commit confirmed
+        5. Deploy to Chutes (chute_id will match pre-generated one)
+        
+        This way, cheaters cannot see your model until after your commit is on-chain.
     
     Examples:
         # Full deployment (public)

@@ -28,273 +28,137 @@ def get_conf(key: str, default: Optional[str] = None) -> Optional[str]:
 # ============================================================================
 # Private HuggingFace Repo Workflow Helpers
 # ============================================================================
+# 
+# This workflow prevents cheaters from copying your model before commit:
+# 1. Upload to PRIVATE HuggingFace repo
+# 2. Pre-generate chute_id (deterministic from username + repo)
+# 3. COMMIT FIRST to blockchain with pre-generated chute_id
+# 4. Make HF repo PUBLIC after commit confirmed
+# 5. Deploy to Chutes (chute_id will match pre-generated one)
+# ============================================================================
 
-class PrivateRepoWorkflow:
-    """Manages private HuggingFace repository workflow for secure model deployment.
+def generate_chute_id(username: str, repo_name: str) -> str:
+    """Pre-generate chute_id before deployment.
     
-    This workflow prevents other miners from monitoring and copying models before
-    the original miner can commit to the blockchain. The flow is:
+    Uses same formula as Chutes: uuid5(NAMESPACE_OID, "{username}::chute::{name}")
+    This allows committing to blockchain BEFORE deploying.
     
-    1. Create PRIVATE HuggingFace repo
-    2. Upload model to private HF repo
-    3. Store HF_TOKEN as Chutes secret (so Chutes can access private repo)
-    4. Deploy to Chutes (pulls from private HF repo using secret)
-    5. Commit to blockchain
-    6. Make HF repo PUBLIC after commit confirmed
+    Args:
+        username: Chutes username
+        repo_name: HuggingFace repo name (e.g., "username/model-name")
+        
+    Returns:
+        Pre-generated chute_id (UUID string)
     """
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{username}::chute::{repo_name}"))
+
+
+def create_private_hf_repo(repo_id: str, hf_token: str) -> bool:
+    """Create a private HuggingFace repository.
     
-    CHUTES_API_BASE = "https://api.chutes.ai"
-    SECRET_KEY_HF_TOKEN = "HF_TOKEN"
-    
-    def __init__(self, hf_token: str, chutes_api_key: str):
-        """Initialize the workflow manager.
+    Args:
+        repo_id: Repository ID (e.g., "username/model-name")
+        hf_token: HuggingFace API token
         
-        Args:
-            hf_token: HuggingFace API token with write access
-            chutes_api_key: Chutes API key for secret management
-        """
-        self.hf_token = hf_token
-        self.chutes_api_key = chutes_api_key
-        self._hf_api = None
-    
-    @property
-    def hf_api(self):
-        """Lazy-load HuggingFace API client."""
-        if self._hf_api is None:
-            from huggingface_hub import HfApi
-            self._hf_api = HfApi(token=self.hf_token)
-        return self._hf_api
-    
-    def create_private_repo(self, repo_id: str) -> bool:
-        """Create a private HuggingFace repository.
-        
-        Args:
-            repo_id: Repository ID (e.g., "username/model-name")
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            self.hf_api.create_repo(
-                repo_id=repo_id,
-                exist_ok=True,
-                repo_type="model",
-                private=True
-            )
-            logger.info(f"Created/verified private repo: {repo_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to create private repo {repo_id}: {e}")
-            return False
-    
-    def upload_to_repo(
-        self,
-        repo_id: str,
-        folder_path: str,
-        commit_message: str = "Model update"
-    ) -> Optional[str]:
-        """Upload model folder to HuggingFace repository.
-        
-        Args:
-            repo_id: Repository ID
-            folder_path: Local path to model folder
-            commit_message: Commit message for the upload
-            
-        Returns:
-            Revision SHA if successful, None otherwise
-        """
-        try:
-            self.hf_api.upload_folder(
-                folder_path=folder_path,
-                repo_id=repo_id,
-                commit_message=commit_message
-            )
-            info = self.hf_api.repo_info(repo_id, repo_type="model")
-            revision = info.sha
-            logger.info(f"Uploaded to {repo_id}, revision: {revision[:12]}...")
-            return revision
-        except Exception as e:
-            logger.error(f"Failed to upload to {repo_id}: {e}")
-            return None
-    
-    def update_visibility(self, repo_id: str, private: bool) -> bool:
-        """Update HuggingFace repository visibility.
-        
-        Args:
-            repo_id: Repository ID
-            private: True for private, False for public
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            from huggingface_hub import update_repo_settings
-            update_repo_settings(
-                repo_id=repo_id,
-                private=private,
-                token=self.hf_token
-            )
-            visibility = "private" if private else "public"
-            logger.info(f"Updated {repo_id} visibility to {visibility}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update visibility for {repo_id}: {e}")
-            return False
-    
-    def make_public(self, repo_id: str) -> bool:
-        """Make a HuggingFace repository public.
-        
-        Args:
-            repo_id: Repository ID
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        return self.update_visibility(repo_id, private=False)
-    
-    async def create_chutes_secret(
-        self,
-        chute_name: str,
-        key: str,
-        value: str
-    ) -> bool:
-        """Create a secret for a Chute deployment.
-        
-        This allows Chutes to access private HuggingFace repositories
-        by storing the HF_TOKEN as an environment variable secret.
-        
-        Args:
-            chute_name: Chute name or identifier for the secret purpose
-            key: Secret key name (e.g., "HF_TOKEN")
-            value: Secret value
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        import aiohttp
-        
-        url = f"{self.CHUTES_API_BASE}/secrets/"
-        payload = {
-            "purpose": chute_name,
-            "key": key,
-            "value": value
-        }
-        headers = {
-            "Authorization": f"Bearer {self.chutes_api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers) as response:
-                    if response.status in (200, 201):
-                        data = await response.json()
-                        secret_id = data.get("secret_id", data.get("id", "unknown"))
-                        logger.info(f"Created Chutes secret '{key}' for {chute_name} (id: {secret_id})")
-                        return True
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Failed to create Chutes secret: {response.status} - {error_text}")
-                        return False
-        except Exception as e:
-            logger.error(f"Failed to create Chutes secret: {e}")
-            return False
-    
-    async def delete_chutes_secret(self, secret_id: str) -> bool:
-        """Delete a Chutes secret by ID.
-        
-        Args:
-            secret_id: Secret identifier to delete
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        import aiohttp
-        
-        url = f"{self.CHUTES_API_BASE}/secrets/{secret_id}"
-        headers = {
-            "Authorization": f"Bearer {self.chutes_api_key}"
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.delete(url, headers=headers) as response:
-                    if response.status in (200, 204):
-                        logger.info(f"Deleted Chutes secret: {secret_id}")
-                        return True
-                    else:
-                        error_text = await response.text()
-                        logger.warning(f"Failed to delete Chutes secret: {response.status} - {error_text}")
-                        return False
-        except Exception as e:
-            logger.warning(f"Failed to delete Chutes secret: {e}")
-            return False
-    
-    async def setup_private_repo_for_chutes(self, repo_id: str) -> bool:
-        """Set up HF_TOKEN secret for Chutes to access private HF repo.
-        
-        Args:
-            repo_id: Repository ID (used as purpose identifier)
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        return await self.create_chutes_secret(
-            chute_name=repo_id,
-            key=self.SECRET_KEY_HF_TOKEN,
-            value=self.hf_token
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=hf_token)
+        api.create_repo(
+            repo_id=repo_id,
+            exist_ok=True,
+            repo_type="model",
+            private=True
         )
+        logger.info(f"Created/verified private repo: {repo_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to create private repo {repo_id}: {e}")
+        return False
+
+
+def upload_to_private_repo(
+    repo_id: str,
+    folder_path: str,
+    hf_token: str,
+    commit_message: str = "Model update"
+) -> Optional[str]:
+    """Upload model to private HuggingFace repo.
     
-    async def execute_private_upload(
-        self,
-        repo_id: str,
-        folder_path: str,
-        commit_message: str = "Model update"
-    ) -> Optional[str]:
-        """Execute the private upload workflow.
+    Args:
+        repo_id: Repository ID
+        folder_path: Local path to model folder
+        hf_token: HuggingFace API token
+        commit_message: Commit message
         
-        1. Create private HF repo
-        2. Upload model
-        3. Set up Chutes secret for private access
-        
-        Args:
-            repo_id: Repository ID
-            folder_path: Local path to model folder
-            commit_message: Commit message
-            
-        Returns:
-            Revision SHA if successful, None otherwise
-        """
-        if not self.create_private_repo(repo_id):
-            return None
-        
-        revision = self.upload_to_repo(repo_id, folder_path, commit_message)
-        if not revision:
-            return None
-        
-        if not await self.setup_private_repo_for_chutes(repo_id):
-            logger.warning("Failed to set up Chutes secret, deployment may fail")
-        
+    Returns:
+        Revision SHA if successful, None otherwise
+    """
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=hf_token)
+        api.upload_folder(
+            folder_path=folder_path,
+            repo_id=repo_id,
+            commit_message=commit_message
+        )
+        info = api.repo_info(repo_id, repo_type="model")
+        revision = info.sha
+        logger.info(f"Uploaded to {repo_id}, revision: {revision[:12]}...")
         return revision
+    except Exception as e:
+        logger.error(f"Failed to upload to {repo_id}: {e}")
+        return None
+
+
+def make_hf_repo_public(repo_id: str, hf_token: str) -> bool:
+    """Make a HuggingFace repository public.
     
-    async def finalize_after_commit(self, repo_id: str) -> bool:
-        """Finalize workflow after successful on-chain commit.
+    Args:
+        repo_id: Repository ID
+        hf_token: HuggingFace API token
         
-        Makes the HuggingFace repository public so validators can access it.
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from huggingface_hub import update_repo_settings
+        update_repo_settings(
+            repo_id=repo_id,
+            private=False,
+            token=hf_token
+        )
+        logger.info(f"Made {repo_id} public")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to make {repo_id} public: {e}")
+        return False
+
+
+async def execute_private_upload(
+    repo_id: str,
+    folder_path: str,
+    hf_token: str,
+    commit_message: str = "Model update"
+) -> Optional[str]:
+    """Execute private upload workflow: create private repo + upload.
+    
+    Args:
+        repo_id: Repository ID
+        folder_path: Local path to model folder
+        hf_token: HuggingFace API token
+        commit_message: Commit message
         
-        Args:
-            repo_id: Repository ID
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        logger.info(f"Finalizing private repo workflow for {repo_id}...")
-        success = self.make_public(repo_id)
-        if success:
-            logger.info(f"Repository {repo_id} is now public")
-        else:
-            logger.error(f"Failed to make {repo_id} public - manual intervention required")
-        return success
+    Returns:
+        Revision SHA if successful, None otherwise
+    """
+    if not create_private_hf_repo(repo_id, hf_token):
+        return None
+    
+    return upload_to_private_repo(repo_id, folder_path, hf_token, commit_message)
 
 
 # ============================================================================
@@ -878,13 +742,24 @@ async def deploy_command(
                 sys.exit(1)
     
     # Determine which steps to run
+    # For private_repo workflow: upload -> commit -> make_public -> deploy
+    # For normal workflow: upload -> deploy -> commit
     steps = []
     if not skip_upload:
         steps.append("upload")
-    if not skip_chutes:
-        steps.append("chutes")
-    if not skip_commit:
-        steps.append("commit")
+    if private_repo:
+        # Private workflow: commit BEFORE deploy
+        if not skip_commit:
+            steps.append("commit")
+            steps.append("make_public")  # Only make public after commit
+        if not skip_chutes:
+            steps.append("chutes")
+    else:
+        # Normal workflow: deploy before commit
+        if not skip_chutes:
+            steps.append("chutes")
+        if not skip_commit:
+            steps.append("commit")
     
     total_steps = len(steps)
     current_step = 0
@@ -901,18 +776,12 @@ async def deploy_command(
         logger.info(f"  Chute ID: {chute_id}")
     logger.info(f"  Steps: {' -> '.join(steps) if steps else 'none'}")
     if private_repo:
-        logger.info("  Mode: PRIVATE REPO (will publish after commit)")
+        logger.info("  Mode: PRIVATE REPO (commit first, then publish + deploy)")
     if dry_run:
         logger.info("  Mode: DRY RUN")
     logger.info("=" * 60)
     
-    # Initialize private repo workflow manager if needed
-    private_workflow = None
-    if private_repo and not dry_run:
-        private_workflow = PrivateRepoWorkflow(
-            hf_token=hf_token,
-            chutes_api_key=chutes_api_key
-        )
+    # Note: private_repo workflow uses standalone functions instead of class
     
     # =========================================================================
     # Step 1: Upload to HuggingFace
@@ -927,12 +796,13 @@ async def deploy_command(
             revision = "dry-run-revision-sha"
         else:
             try:
-                # Use private workflow if enabled
-                if private_workflow:
-                    logger.info(f"  Using private repo workflow...")
-                    revision = await private_workflow.execute_private_upload(
+                # Use private upload if enabled
+                if private_repo:
+                    logger.info("  Using private repo workflow...")
+                    revision = await execute_private_upload(
                         repo_id=repo,
                         folder_path=model_path,
+                        hf_token=hf_token,
                         commit_message=message
                     )
                     if not revision:
@@ -971,20 +841,91 @@ async def deploy_command(
         logger.info(f"Skipping upload, using revision: {revision[:12]}...")
     
     # =========================================================================
-    # Step 2: Deploy to Chutes
+    # PRIVATE REPO WORKFLOW: Pre-generate chute_id, commit first, then deploy
     # =========================================================================
-    if not skip_chutes:
-        current_step += 1
-        logger.info(f"[{current_step}/{total_steps}] Deploying to Chutes...")
+    if private_repo:
+        # Pre-generate chute_id (same formula as Chutes uses internally)
+        if not chute_id and not skip_chutes:
+            chute_id = generate_chute_id(chute_user, repo)
+            logger.info(f"  Pre-generated chute_id: {chute_id}")
         
-        if dry_run:
-            logger.info(f"  [DRY RUN] Would deploy {repo}@{revision[:12]}...")
-            chute_id = "dry-run-chute-id"
+        # Step: Commit on-chain FIRST (before deploy)
+        if not skip_commit:
+            current_step += 1
+            logger.info(f"[{current_step}/{total_steps}] Committing on-chain (before deploy)...")
+            
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would commit {repo}@{revision[:12]}... with chute {chute_id}")
+            else:
+                try:
+                    import bittensor as bt
+                    from bittensor.core.errors import MetadataError
+                    from affine.utils.subtensor import get_subtensor
+                    
+                    cold = coldkey or get_conf("BT_WALLET_COLD", "default")
+                    hot = hotkey or get_conf("BT_WALLET_HOT", "default")
+                    wallet = bt.Wallet(name=cold, hotkey=hot)
+                    
+                    logger.info(f"  Using wallet: {wallet.hotkey.ss58_address[:16]}...")
+                    
+                    sub = await get_subtensor()
+                    data = json.dumps({
+                        "model": repo,
+                        "revision": revision,
+                        "chute_id": chute_id
+                    })
+                    
+                    while True:
+                        try:
+                            await sub.set_reveal_commitment(
+                                wallet=wallet,
+                                netuid=NETUID,
+                                data=data,
+                                blocks_until_reveal=1
+                            )
+                            break
+                        except MetadataError as e:
+                            if "SpaceLimitExceeded" in str(e):
+                                logger.warning("Space limit exceeded, waiting for next block...")
+                                await sub.wait_for_block()
+                            else:
+                                raise
+                    
+                    logger.info("  Commit successful")
+                    
+                except Exception as e:
+                    logger.error(f"On-chain commit failed: {e}")
+                    print(json.dumps({"success": False, "error": f"On-chain commit failed: {str(e)}"}))
+                    sys.exit(1)
         else:
-            try:
-                # Generate Chute configuration (same as chutes_push_command)
-                chutes_config = textwrap.dedent(
-                    f"""
+            logger.info("Skipping on-chain commit")
+            logger.warning("Private repo workflow: HF repo remains PRIVATE since commit was skipped")
+        
+        # Step: Make HF repo public (after commit)
+        if "make_public" in steps:
+            current_step += 1
+            logger.info(f"[{current_step}/{total_steps}] Making HF repo public...")
+            
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would make {repo} public")
+            else:
+                if not make_hf_repo_public(repo, hf_token):
+                    logger.warning("Failed to make repo public - manual intervention may be required")
+                    logger.warning(f"Run: huggingface-cli repo visibility {repo} --public")
+                else:
+                    logger.info(f"  Repository {repo} is now public")
+        
+        # Step: Deploy to Chutes (after commit and make public)
+        if not skip_chutes:
+            current_step += 1
+            logger.info(f"[{current_step}/{total_steps}] Deploying to Chutes...")
+            
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would deploy {repo}@{revision[:12]}...")
+            else:
+                try:
+                    chutes_config = textwrap.dedent(
+                        f"""
 import os
 from chutes.chute import NodeSelector
 from chutes.chute.template.sglang import build_sglang_chute
@@ -1006,132 +947,198 @@ chute = build_sglang_chute(
     shutdown_after_seconds=28800,
 )
 """
-                )
-                
-                tmp_file = Path("tmp_chute.py")
-                tmp_file.write_text(chutes_config)
-                logger.debug(f"Wrote Chute config to {tmp_file}")
-                
-                # Deploy to Chutes
-                cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--accept-fee"]
-                env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
-                
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    stdin=asyncio.subprocess.PIPE,
-                )
-                
-                if proc.stdin:
-                    proc.stdin.write(b"y\n")
-                    await proc.stdin.drain()
-                    proc.stdin.close()
-                
-                stdout, _ = await proc.communicate()
-                output = stdout.decode(errors="ignore")
-                logger.trace(output)
-                
-                # Check for errors
-                import re
-                match = re.search(
-                    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
-                )
-                if match and match.group(2) == "ERROR":
-                    logger.debug("Chutes deploy failed with error log")
-                    raise RuntimeError("Chutes deploy failed")
-                
-                if proc.returncode != 0:
-                    logger.debug(f"Chutes deploy failed with code {proc.returncode}")
-                    raise RuntimeError("Chutes deploy failed")
-                
-                tmp_file.unlink(missing_ok=True)
-                logger.debug("Chute deployment successful")
-                
-                # Get chute ID
-                chute_id = await get_latest_chute_id(repo, api_key=chutes_api_key)
-                
-                if not chute_id:
-                    raise RuntimeError("Failed to get chute_id after deployment")
-                
-                logger.info(f"  Chutes deployment complete. Chute ID: {chute_id}")
-                
-            except Exception as e:
-                logger.error(f"Chutes deployment failed: {e}")
-                if 'tmp_file' in locals():
+                    )
+                    
+                    tmp_file = Path("tmp_chute.py")
+                    tmp_file.write_text(chutes_config)
+                    logger.debug(f"Wrote Chute config to {tmp_file}")
+                    
+                    cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--accept-fee"]
+                    env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
+                    
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        stdin=asyncio.subprocess.PIPE,
+                    )
+                    
+                    if proc.stdin:
+                        proc.stdin.write(b"y\n")
+                        await proc.stdin.drain()
+                        proc.stdin.close()
+                    
+                    stdout, _ = await proc.communicate()
+                    output = stdout.decode(errors="ignore")
+                    logger.trace(output)
+                    
+                    import re
+                    match = re.search(
+                        r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
+                    )
+                    if match and match.group(2) == "ERROR":
+                        logger.debug("Chutes deploy failed with error log")
+                        raise RuntimeError("Chutes deploy failed")
+                    
+                    if proc.returncode != 0:
+                        logger.debug(f"Chutes deploy failed with code {proc.returncode}")
+                        raise RuntimeError("Chutes deploy failed")
+                    
                     tmp_file.unlink(missing_ok=True)
-                print(json.dumps({"success": False, "error": f"Chutes deployment failed: {str(e)}"}))
-                sys.exit(1)
-    else:
-        logger.info(f"Skipping Chutes deployment, using chute_id: {chute_id}")
+                    logger.info(f"  Chutes deployment complete. Chute ID: {chute_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Chutes deployment failed: {e}")
+                    if 'tmp_file' in locals():
+                        tmp_file.unlink(missing_ok=True)
+                    print(json.dumps({"success": False, "error": f"Chutes deployment failed: {str(e)}"}))
+                    sys.exit(1)
     
     # =========================================================================
-    # Step 3: Commit on-chain
+    # NORMAL WORKFLOW: Deploy first, then commit
     # =========================================================================
-    if not skip_commit:
-        current_step += 1
-        logger.info(f"[{current_step}/{total_steps}] Committing on-chain...")
-        
-        if dry_run:
-            logger.info(f"  [DRY RUN] Would commit {repo}@{revision[:12]}... with chute {chute_id}")
-        else:
-            try:
-                import bittensor as bt
-                from bittensor.core.errors import MetadataError
-                from affine.utils.subtensor import get_subtensor
-                
-                cold = coldkey or get_conf("BT_WALLET_COLD", "default")
-                hot = hotkey or get_conf("BT_WALLET_HOT", "default")
-                wallet = bt.Wallet(name=cold, hotkey=hot)
-                
-                logger.info(f"  Using wallet: {wallet.hotkey.ss58_address[:16]}...")
-                
-                sub = await get_subtensor()
-                data = json.dumps({
-                    "model": repo,
-                    "revision": revision,
-                    "chute_id": chute_id
-                })
-                
-                while True:
-                    try:
-                        await sub.set_reveal_commitment(
-                            wallet=wallet,
-                            netuid=NETUID,
-                            data=data,
-                            blocks_until_reveal=1
-                        )
-                        break
-                    except MetadataError as e:
-                        if "SpaceLimitExceeded" in str(e):
-                            logger.warning("Space limit exceeded, waiting for next block...")
-                            await sub.wait_for_block()
-                        else:
-                            raise
-                
-                logger.info("  Commit successful")
-                
-                # =========================================================
-                # Step 4: Make HF repo public (if private workflow)
-                # =========================================================
-                if private_workflow:
-                    logger.info(f"[{current_step}/{total_steps}] Making HF repo public...")
-                    if not await private_workflow.finalize_after_commit(repo):
-                        logger.warning("Failed to make repo public - manual intervention may be required")
-                        logger.warning(f"Run: huggingface-cli repo visibility {repo} --public")
-                
-            except Exception as e:
-                logger.error(f"On-chain commit failed: {e}")
-                print(json.dumps({"success": False, "error": f"On-chain commit failed: {str(e)}"}))
-                sys.exit(1)
     else:
-        logger.info("Skipping on-chain commit")
+        # Step: Deploy to Chutes
+        if not skip_chutes:
+            current_step += 1
+            logger.info(f"[{current_step}/{total_steps}] Deploying to Chutes...")
+            
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would deploy {repo}@{revision[:12]}...")
+                chute_id = "dry-run-chute-id"
+            else:
+                try:
+                    chutes_config = textwrap.dedent(
+                        f"""
+import os
+from chutes.chute import NodeSelector
+from chutes.chute.template.sglang import build_sglang_chute
+os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+
+chute = build_sglang_chute(
+    username="{chute_user}",
+    readme="{repo}",
+    model_name="{repo}",
+    image="chutes/sglang:nightly-2025081600",
+    concurrency=40,
+    revision="{revision}",
+    node_selector=NodeSelector(
+        gpu_count=4,
+        include=["h200"],
+    ),
+    scaling_threshold=0.5,
+    max_instances=2,
+    shutdown_after_seconds=28800,
+)
+"""
+                    )
+                    
+                    tmp_file = Path("tmp_chute.py")
+                    tmp_file.write_text(chutes_config)
+                    logger.debug(f"Wrote Chute config to {tmp_file}")
+                    
+                    cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--accept-fee"]
+                    env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
+                    
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        stdin=asyncio.subprocess.PIPE,
+                    )
+                    
+                    if proc.stdin:
+                        proc.stdin.write(b"y\n")
+                        await proc.stdin.drain()
+                        proc.stdin.close()
+                    
+                    stdout, _ = await proc.communicate()
+                    output = stdout.decode(errors="ignore")
+                    logger.trace(output)
+                    
+                    import re
+                    match = re.search(
+                        r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
+                    )
+                    if match and match.group(2) == "ERROR":
+                        logger.debug("Chutes deploy failed with error log")
+                        raise RuntimeError("Chutes deploy failed")
+                    
+                    if proc.returncode != 0:
+                        logger.debug(f"Chutes deploy failed with code {proc.returncode}")
+                        raise RuntimeError("Chutes deploy failed")
+                    
+                    tmp_file.unlink(missing_ok=True)
+                    logger.debug("Chute deployment successful")
+                    
+                    chute_id = await get_latest_chute_id(repo, api_key=chutes_api_key)
+                    
+                    if not chute_id:
+                        raise RuntimeError("Failed to get chute_id after deployment")
+                    
+                    logger.info(f"  Chutes deployment complete. Chute ID: {chute_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Chutes deployment failed: {e}")
+                    if 'tmp_file' in locals():
+                        tmp_file.unlink(missing_ok=True)
+                    print(json.dumps({"success": False, "error": f"Chutes deployment failed: {str(e)}"}))
+                    sys.exit(1)
+        else:
+            logger.info(f"Skipping Chutes deployment, using chute_id: {chute_id}")
         
-        # If skipping commit but using private repo, warn user
-        if private_repo:
-            logger.warning("Private repo workflow: HF repo remains PRIVATE since commit was skipped")
-            logger.warning(f"To make public later: huggingface-cli repo visibility {repo} --public")
+        # Step: Commit on-chain
+        if not skip_commit:
+            current_step += 1
+            logger.info(f"[{current_step}/{total_steps}] Committing on-chain...")
+            
+            if dry_run:
+                logger.info(f"  [DRY RUN] Would commit {repo}@{revision[:12]}... with chute {chute_id}")
+            else:
+                try:
+                    import bittensor as bt
+                    from bittensor.core.errors import MetadataError
+                    from affine.utils.subtensor import get_subtensor
+                    
+                    cold = coldkey or get_conf("BT_WALLET_COLD", "default")
+                    hot = hotkey or get_conf("BT_WALLET_HOT", "default")
+                    wallet = bt.Wallet(name=cold, hotkey=hot)
+                    
+                    logger.info(f"  Using wallet: {wallet.hotkey.ss58_address[:16]}...")
+                    
+                    sub = await get_subtensor()
+                    data = json.dumps({
+                        "model": repo,
+                        "revision": revision,
+                        "chute_id": chute_id
+                    })
+                    
+                    while True:
+                        try:
+                            await sub.set_reveal_commitment(
+                                wallet=wallet,
+                                netuid=NETUID,
+                                data=data,
+                                blocks_until_reveal=1
+                            )
+                            break
+                        except MetadataError as e:
+                            if "SpaceLimitExceeded" in str(e):
+                                logger.warning("Space limit exceeded, waiting for next block...")
+                                await sub.wait_for_block()
+                            else:
+                                raise
+                    
+                    logger.info("  Commit successful")
+                    
+                except Exception as e:
+                    logger.error(f"On-chain commit failed: {e}")
+                    print(json.dumps({"success": False, "error": f"On-chain commit failed: {str(e)}"}))
+                    sys.exit(1)
+        else:
+            logger.info("Skipping on-chain commit")
     
     # =========================================================================
     # Summary
